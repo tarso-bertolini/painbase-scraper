@@ -1,0 +1,66 @@
+name: scrape-reclameaqui
+
+# Runs the Reclame Aqui scraper on a 6-hour cadence and on demand.
+# This is a public repo, so GHA minutes are unmetered — the cron
+# can be as aggressive as we need without burning the free quota.
+
+on:
+  schedule:
+    # Every 6 hours, on the hour.
+    # Cron is in UTC; the times here translate to São Paulo (UTC-3)
+    # roughly: 00:00, 06:00, 12:00, 18:00 UTC = 21h, 03h, 09h, 15h SP.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      brands:
+        description: 'Space-separated RA company slugs (default: BR fintech set)'
+        required: false
+        default: ''
+
+concurrency:
+  # Don't let two scheduled runs stack on top of each other.
+  group: scrape-reclameaqui
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - run: pnpm install --frozen-lockfile
+
+      # Playwright's browser binaries are big (~300MB) — cache them
+      # so we only download once per browser-version bump.
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Install Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: pnpm playwright install chromium --with-deps
+
+      - name: Scrape
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.brands }}" ]; then
+            pnpm tsx scripts/scrape/reclameaqui.ts ${{ inputs.brands }}
+          else
+            pnpm tsx scripts/scrape/reclameaqui.ts
+          fi

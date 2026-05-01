@@ -1,0 +1,24 @@
+{
+  "name": "painbase-scraper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright scraping fleet for Painbase, running on GitHub Actions free tier.",
+  "type": "module",
+  "scripts": {
+    "scrape:ra": "tsx scripts/scrape/reclameaqui.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
