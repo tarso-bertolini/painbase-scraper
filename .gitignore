@@ -7,5 +7,18 @@ dist/
 playwright-report/
 test-results/
 
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Camoufox cached browser binaries
+.cache/
+
 # Local scrape outputs (--dry-run dumps go here)
 out/

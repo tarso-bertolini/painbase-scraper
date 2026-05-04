@@ -1,0 +1,15 @@
+# Production deps for the Scrapling-based scraping fleet.
+# Python 3.11+ recommended (Scrapling needs >=3.10).
+
+# Anti-bot scraping framework. BSD-3-Clause.
+# https://github.com/D4Vinci/Scrapling
+# Bundled features we rely on:
+#   - StealthyFetcher (Camoufox-based, defeats Cloudflare Turnstile)
+#   - TLS fingerprint impersonation (Chrome/Firefox/Safari)
+#   - Adaptive selectors that survive HTML changes
+#   - Built-in proxy rotation
+scrapling>=0.2.99
+
+# HTTP client used by the ingest module to POST scraped batches back
+# to the Painbase API. Pinned conservatively — anything 2.x works.
+httpx>=0.27.0
