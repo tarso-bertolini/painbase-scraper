@@ -1,27 +1,27 @@
-"""Reclame Aqui scraper — Scrapling/StealthyFetcher edition.
+"""Reclame Aqui scraper — Scrapling/StealthyFetcher with XHR capture.
 
-Why Scrapling:
-    The earlier Playwright + stealth-plugin TS implementation bounced
-    off Cloudflare's Turnstile every time we probed RA's iosite JSON
-    endpoint. Scrapling's StealthyFetcher is built on Camoufox — a
-    Firefox fork specifically tuned for stealth — and ships purpose-
-    built bypass logic for Cloudflare Turnstile/Interstitial.
+The story so far:
+    Initial attempt: hit iosite.reclameaqui.com.br directly. CF 403'd
+    every request including from a browser session that had already
+    cleared the challenge.
 
-    Documented bypass quote from Scrapling's README:
-        "Can easily bypass all types of Cloudflare's Turnstile/
-         Interstitial with automation."
+    Fix: don't fetch iosite ourselves. Visit the listing page in a
+    real Camoufox browser, let the SPA make ITS OWN XHR calls to
+    iosite (which carry whatever auth header the SPA generates), and
+    intercept the JSON responses via Scrapling's `capture_xhr` regex.
 
-    BSD-3-Clause license; we're free to use, modify, and ship.
+Endpoint discovered via the probe at scripts/probe_ra_xhr.py:
+    https://iosite.reclameaqui.com.br/raichu-io-site-v1/companyshowcase/
+    company/{numeric_id}/items
 
-Strategy (same shape as the older TS scraper):
-    1. Hit the company's public HTML page first via StealthyFetcher.
-       This solves the CF challenge on the page session.
-    2. Then call the JSON endpoint at iosite.reclameaqui.com.br
-       through the same fetcher session — the CF cookie carries.
-    3. Walk the paginated complaint list per brand, normalize to the
-       Painbase ScrapedPost shape, and POST to the ingest API.
+    Returns JSON: { prev, next, data: [...], count, maxScore, aggregations }
+    where each `data[]` row is a complaint with title, description,
+    creationDate, status, url, etc.
 
-Run locally (after `pip install -r requirements.txt`):
+Pagination: re-navigate to the listing page with ?pagina=2, ?pagina=3
+each triggers a fresh XHR round we capture.
+
+Run locally:
     python scripts/scrape/reclameaqui.py nubank --dry-run
     python scripts/scrape/reclameaqui.py nubank cashu c6-bank
 
@@ -45,13 +45,19 @@ from scrapling.fetchers import StealthyFetcher  # type: ignore[import-not-found]
 from painbase_scraper import ScrapedPost, post_scrapes_to_ingest
 
 RA_BASE = "https://www.reclameaqui.com.br"
-IOSITE = "https://iosite.reclameaqui.com.br/raichu-io-site-v1"
-PAGE_SIZE = 30
-MAX_PAGES_PER_BRAND = 3  # ~90 complaints/brand/run
+
+# Number of paginated URLs to walk per brand. Each navigation = one
+# capture round. RA serves ~10 complaints per page on the listing.
+MAX_PAGES_PER_BRAND = 5
+
+# XHR capture regex. Matches the JSON endpoint the SPA actually calls.
+XHR_PATTERN = (
+    r"iosite\.reclameaqui\.com\.br/raichu-io-site-v1/"
+    r"companyshowcase/company/\d+/items"
+)
 
 
 def _build_complaint_url(c: dict[str, Any], slug: str) -> str | None:
-    """Mirror the URL-builder from the TS scraper's normalize step."""
     raw_url = c.get("url")
     if isinstance(raw_url, str) and raw_url:
         return raw_url if raw_url.startswith("http") else f"{RA_BASE}{raw_url}"
@@ -62,11 +68,6 @@ def _build_complaint_url(c: dict[str, Any], slug: str) -> str | None:
 
 
 def _normalize(c: dict[str, Any], slug: str) -> ScrapedPost | None:
-    """Translate a single RA JSON complaint into a Painbase ScrapedPost.
-
-    Returns None when the row is malformed enough to skip (no title,
-    no addressable URL).
-    """
     title = str(c.get("title") or "").strip()
     if not title:
         return None
@@ -79,7 +80,6 @@ def _normalize(c: dict[str, Any], slug: str) -> ScrapedPost | None:
     )
     if created_raw:
         try:
-            # RA serves ISO-ish dates; fall back to now() on parse failure.
             created_iso = (
                 datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
                 .astimezone(timezone.utc)
@@ -97,9 +97,9 @@ def _normalize(c: dict[str, Any], slug: str) -> ScrapedPost | None:
         title=title[:300],
         content=description,
         url=url,
-        # Reuse the subreddit slot for the company slug — matches the TS
-        # convention so the watch dashboard's "Companies" rollup works
-        # across both code paths.
+        # Reuse the subreddit slot for the company slug — matches the
+        # convention used elsewhere so the watch dashboard's
+        # "Companies" rollup works across sources.
         subreddit=slug,
         upvotes=0,
         comments_count=0,
@@ -108,109 +108,99 @@ def _normalize(c: dict[str, Any], slug: str) -> ScrapedPost | None:
     )
 
 
-def _extract_complaints(data: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
-    """Pull the complaint list out of any of the response shapes RA
-    has used historically. Fail closed (empty list) on unknown shape.
+def _extract_complaints(captured_xhr_list: list) -> list[dict[str, Any]]:
+    """Pull complaint dicts out of every captured XHR response.
+
+    Each `companyshowcase/company/{id}/items` response carries a
+    `data` array. Concat across all captures, return raw dicts.
     """
-    if isinstance(data, list):
-        return [c for c in data if isinstance(c, dict)]
-    if not isinstance(data, dict):
-        return []
-
-    complains = data.get("complains")
-    if isinstance(complains, list):
-        return [c for c in complains if isinstance(c, dict)]
-    if isinstance(complains, dict):
-        inner = complains.get("data")
-        if isinstance(inner, list):
-            return [c for c in inner if isinstance(c, dict)]
-
-    inner_data = data.get("data")
-    if isinstance(inner_data, list):
-        return [c for c in inner_data if isinstance(c, dict)]
-
-    return []
+    out: list[dict[str, Any]] = []
+    for xhr in captured_xhr_list:
+        body = getattr(xhr, "body", None)
+        if body is None:
+            text = getattr(xhr, "text", "")
+            body = text.encode("utf-8") if text else b""
+        if isinstance(body, bytes):
+            body_str = body.decode("utf-8", errors="replace")
+        else:
+            body_str = str(body)
+        if not body_str:
+            continue
+        try:
+            data = json.loads(body_str)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        items = data.get("data")
+        if isinstance(items, list):
+            out.extend(c for c in items if isinstance(c, dict))
+    return out
 
 
 def scrape_brand(slug: str) -> list[ScrapedPost]:
-    """Pull up to MAX_PAGES_PER_BRAND × PAGE_SIZE complaints for one
-    company slug and return them as ScrapedPost rows.
-
-    Empty list on bypass failure — never raises, so a single broken
-    brand can't kill the whole run.
-    """
-    print(f"[ra:{slug}] launching StealthyFetcher...", flush=True)
+    """Pull complaints for one company slug across MAX_PAGES_PER_BRAND
+    paginated visits. Returns ScrapedPost rows; never raises."""
+    print(f"[ra:{slug}] launching StealthyFetcher (XHR capture)...", flush=True)
 
     out: list[ScrapedPost] = []
     seen: set[str] = set()
 
-    # Step 1 — visit the company HTML page to clear the CF challenge.
-    # `solve_cloudflare=True` tells Scrapling to wait through (and
-    # solve, if Turnstile-style) the interstitial automatically.
-    company_url = f"{RA_BASE}/empresa/{slug}/"
-    fetcher = StealthyFetcher
-
-    try:
-        prime = fetcher.fetch(
-            company_url,
-            headless=True,
-            solve_cloudflare=True,
-            disable_resources=True,  # ad / image blocking — faster + less detection
-            network_idle=True,
-            humanize=True,           # add human-like cursor / typing jitter
-            timeout=45000,
+    for page_no in range(1, MAX_PAGES_PER_BRAND + 1):
+        # /lista-reclamacoes/ is the SPA-rendered listing page. Each
+        # navigation triggers a fresh round of iosite XHRs we capture.
+        url = (
+            f"{RA_BASE}/empresa/{slug}/lista-reclamacoes/"
+            if page_no == 1
+            else f"{RA_BASE}/empresa/{slug}/lista-reclamacoes/?pagina={page_no}"
         )
-    except Exception as e:
-        print(f"[ra:{slug}] prime navigation failed: {e}", flush=True)
-        return out
 
-    if prime is None or getattr(prime, "status", None) not in (200, 304):
-        print(f"[ra:{slug}] prime returned status="
-              f"{getattr(prime, 'status', '?')} — bailing", flush=True)
-        return out
+        def trigger_lazy_load(page):
+            # Scroll a few viewports to make the SPA load its lazy
+            # complaint cards (which is what triggers the XHR).
+            for _ in range(4):
+                page.mouse.wheel(0, 1500)
+                page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500)
+            return page
 
-    # Step 2 — call the JSON endpoint. StealthyFetcher.fetch reuses
-    # the underlying browser session by default, so the CF cookie
-    # carries automatically. Walk pages until we get an empty page or
-    # a short page (last page).
-    for page_no in range(MAX_PAGES_PER_BRAND):
-        api_url = (
-            f"{IOSITE}/companies/shortname/{slug}/complains"
-            f"?count={PAGE_SIZE}&start={page_no * PAGE_SIZE}&filter=created_desc"
-        )
         try:
-            resp = fetcher.fetch(
-                api_url,
+            resp = StealthyFetcher.fetch(
+                url,
                 headless=True,
-                solve_cloudflare=False,  # already solved on prime
+                network_idle=True,
+                timeout=90000,
+                wait=2000,
+                page_action=trigger_lazy_load,
+                capture_xhr=XHR_PATTERN,
                 disable_resources=True,
-                network_idle=False,
-                timeout=30000,
+                solve_cloudflare=True,
+                humanize=True,
             )
         except Exception as e:
-            print(f"[ra:{slug}] page {page_no} fetch error: {e}", flush=True)
+            print(f"[ra:{slug}] page {page_no} fetch failed: {e}", flush=True)
             break
 
-        if resp is None or getattr(resp, "status", None) != 200:
-            print(f"[ra:{slug}] page {page_no} status="
-                  f"{getattr(resp, 'status', '?')} — stopping", flush=True)
+        if resp is None or getattr(resp, "status", None) not in (200, 304):
+            print(
+                f"[ra:{slug}] page {page_no} status="
+                f"{getattr(resp, 'status', '?')} — stopping",
+                flush=True,
+            )
             break
 
-        # Scrapling responses expose .text (raw body). The endpoint
-        # returns JSON; if it ever serves HTML, we treat as no-data.
-        body = getattr(resp, "text", "") or ""
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            print(f"[ra:{slug}] page {page_no} non-JSON body — stopping", flush=True)
-            break
-
-        items = _extract_complaints(data)
-        if not items:
+        captured = list(getattr(resp, "captured_xhr", []) or [])
+        complaints = _extract_complaints(captured)
+        if not complaints:
+            print(
+                f"[ra:{slug}] page {page_no} captured {len(captured)} XHRs "
+                f"but 0 complaints in payload — stopping",
+                flush=True,
+            )
             break
 
         added = 0
-        for c in items:
+        for c in complaints:
             post = _normalize(c, slug)
             if post is None:
                 continue
@@ -221,13 +211,18 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
             out.append(post)
             added += 1
 
-        print(f"[ra:{slug}] page {page_no}: {len(items)} fetched, "
-              f"{added} new", flush=True)
+        print(
+            f"[ra:{slug}] page {page_no}: {len(captured)} XHRs, "
+            f"{len(complaints)} complaints, {added} new",
+            flush=True,
+        )
 
-        if len(items) < PAGE_SIZE:
+        # If this page yielded nothing new, the SPA returned the same
+        # cursor — no point continuing.
+        if added == 0:
             break
 
-        time.sleep(1.0)  # polite throttle between pages
+        time.sleep(1.5)  # polite throttle between page navigations
 
     print(f"[ra:{slug}] done — {len(out)} complaints", flush=True)
     return out
@@ -258,8 +253,11 @@ def main() -> int:
     result = post_scrapes_to_ingest(
         all_posts, source="reclameaqui", run_id=run_id,
     )
-    print(f"[ra] ingest result: inserted={result.inserted} "
-          f"duplicates={result.duplicates} skipped={result.skipped}", flush=True)
+    print(
+        f"[ra] ingest result: inserted={result.inserted} "
+        f"duplicates={result.duplicates} skipped={result.skipped}",
+        flush=True,
+    )
     if result.errors:
         for err in result.errors:
             print(f"  ! {err}", flush=True)
