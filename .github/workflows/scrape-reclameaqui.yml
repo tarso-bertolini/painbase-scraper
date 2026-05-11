@@ -11,8 +11,18 @@ name: scrape-reclameaqui
 # stealth-plugin couldn't.
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
+  # Schedule disabled — RA is silently anti-bot-blocking our session.
+  # Their /items XHR returns an empty `{data: []}` template for every
+  # bare call (proven across 5 workflow runs on 2026-05-11), and
+  # their SSR'd HTML contains no /relato/ links to fall back to.
+  # The OTHER iosite endpoints (pageviews, companypagealert) return
+  # real content, so it's specifically the complaints endpoint that's
+  # gated. Re-enable when we have a residential proxy or a working
+  # bypass; until then the cron just burns 30 min of GHA quota per
+  # run for zero ingest.
+  #
+  # schedule:
+  #   - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       brands:
