@@ -28,8 +28,10 @@ Run locally:
 Run on GHA: see .github/workflows/scrape-reclameaqui.yml.
 """
 from __future__ import annotations
+import html
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -173,6 +175,76 @@ def _extract_complaints(captured_xhr_list: list, debug_slug: str = "") -> list[d
     return out
 
 
+def _parse_html_listing(body: str, slug: str) -> list[ScrapedPost]:
+    """HTML-parsing fallback for when XHR capture yields nothing.
+
+    RA's /lista-reclamacoes/ is SSR-rendered for SEO, so the first
+    page of complaint cards is in the initial HTML. Each complaint
+    is wrapped in markup that includes:
+      - href="/empresa/{slug}/relato/{ID}/{title-slug}"   (the URL)
+      - an adjacent <h4> or <h3> with the complaint title
+
+    The XHR path was preferred because it gave us creationDate +
+    description + status. The HTML path only yields title + URL,
+    but that's enough for our keyword-search pipeline downstream.
+    """
+    # 1. Pull every relato href. Each href is the canonical URL for
+    # one complaint and embeds the title in its trailing slug, which
+    # we fall back to when the surrounding markup doesn't expose a
+    # <h3>/<h4>.
+    href_pattern = re.compile(
+        rf'href="(/empresa/{re.escape(slug)}/relato/[^"]+)"'
+    )
+    href_matches = href_pattern.findall(body)
+
+    # Deduplicate (RA frequently emits the same href in card + "open"
+    # button markup) while preserving order.
+    seen_urls: set[str] = set()
+    ordered_hrefs: list[str] = []
+    for h in href_matches:
+        if h not in seen_urls:
+            seen_urls.add(h)
+            ordered_hrefs.append(h)
+
+    # 2. For each href, look for the nearest preceding/following
+    # <h3>/<h4> title. RA wraps card content in markup like:
+    #   <a href="..."><h3>Title</h3></a>
+    # or sometimes the title is in a sibling. Try the inline-link
+    # pattern first, then fall back to the URL-slug derivation.
+    inline_title_pattern = re.compile(
+        rf'href="(/empresa/{re.escape(slug)}/relato/[^"]+)"[^>]*>'
+        r'\s*<h[34][^>]*>([^<]{8,200})</h[34]>'
+    )
+    inline_titles: dict[str, str] = {}
+    for url, title in inline_title_pattern.findall(body):
+        inline_titles[url] = html.unescape(title).strip()
+
+    out: list[ScrapedPost] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for href in ordered_hrefs:
+        url = f"{RA_BASE}{href}"
+        title = inline_titles.get(href)
+        if not title:
+            # Derive from URL slug: /relato/12345678/i-have-a-problem
+            # → "I have a problem"
+            tail = href.rstrip("/").rsplit("/", 1)[-1]
+            title = tail.replace("-", " ").strip().capitalize()
+        if not title:
+            continue
+        out.append(ScrapedPost(
+            source="reclameaqui",
+            title=title[:300],
+            content=title,  # HTML path doesn't carry the body
+            url=url,
+            subreddit=slug,
+            upvotes=0,
+            comments_count=0,
+            author=None,
+            created_at=now_iso,
+        ))
+    return out
+
+
 def scrape_brand(slug: str) -> list[ScrapedPost]:
     """Pull complaints for one company slug across MAX_PAGES_PER_BRAND
     paginated visits. Returns ScrapedPost rows; never raises."""
@@ -235,10 +307,44 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
 
         captured = list(getattr(resp, "captured_xhr", []) or [])
         complaints = _extract_complaints(captured, debug_slug=slug)
+
         if not complaints:
+            # RA's SPA stopped firing param'd /items XHRs — the
+            # /items endpoint now returns an all-null template for
+            # bare calls. Fall back to parsing the SSR-rendered
+            # HTML body, which still ships the first page of
+            # complaint cards for SEO.
+            body = getattr(resp, "body", None)
+            if isinstance(body, bytes):
+                body_str = body.decode("utf-8", errors="replace")
+            else:
+                body_str = str(body or "")
+            html_posts = _parse_html_listing(body_str, slug)
+            if html_posts:
+                added = 0
+                for post in html_posts:
+                    key = post.url or post.title
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(post)
+                    added += 1
+                print(
+                    f"[ra:{slug}] page {page_no} html-fallback: "
+                    f"parsed {len(html_posts)} cards, {added} new",
+                    flush=True,
+                )
+                # HTML fallback yields the FIRST page only — RA's
+                # pagination is JS-driven and our XHR capture isn't
+                # delivering it. Stop here; we'll get fresh page-1
+                # data again on the next run.
+                if added == 0:
+                    break
+                time.sleep(1.5)
+                continue
             print(
                 f"[ra:{slug}] page {page_no} captured {len(captured)} XHRs "
-                f"but 0 complaints in payload — stopping",
+                f"+ html-fallback yielded 0 — stopping",
                 flush=True,
             )
             break
