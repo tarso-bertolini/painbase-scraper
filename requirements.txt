@@ -8,7 +8,16 @@
 #   - TLS fingerprint impersonation (Chrome/Firefox/Safari)
 #   - Adaptive selectors that survive HTML changes
 #   - Built-in proxy rotation
-scrapling>=0.2.99
+#
+# `[fetchers]` extra pulls Playwright + curl_cffi (needed for
+# StealthyFetcher.fetch). Without the extra Scrapling installs as a
+# parser-only library and `from scrapling.fetchers import …` raises.
+scrapling[fetchers]>=0.4.7
+
+# Stealth-tuned Firefox build, driven by Scrapling's StealthyFetcher.
+# Pulled separately so that the workflow's `python -m camoufox fetch`
+# step actually finds the module to invoke.
+camoufox>=0.4.11
 
 # HTTP client used by the ingest module to POST scraped batches back
 # to the Painbase API. Pinned conservatively — anything 2.x works.
