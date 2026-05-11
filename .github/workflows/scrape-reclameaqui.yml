@@ -40,6 +40,21 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      # Scrapling's StealthyFetcher uses Camoufox (Firefox) as the
+      # primary browser, but `solve_cloudflare=True` internally spins
+      # up a Playwright Chromium instance for Turnstile challenges.
+      # We need BOTH browsers cached.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium firefox
+
       # Camoufox bundles its own Firefox build (~120MB). Cache the
       # download dir so we only pay the install once per Camoufox
       # version bump, not on every run.
@@ -55,6 +70,9 @@ jobs:
         run: |
           python -m camoufox fetch
           # System libs Firefox needs on minimal Ubuntu runners.
+          # (playwright install --with-deps installs most of these too,
+          #  but Camoufox's bundled Firefox uses a slightly different
+          #  set of libs — keep this step as belt-and-suspenders.)
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-3-0 libasound2t64 libdbus-glib-1-2 libxt6
