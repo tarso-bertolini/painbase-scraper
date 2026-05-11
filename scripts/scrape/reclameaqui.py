@@ -108,14 +108,21 @@ def _normalize(c: dict[str, Any], slug: str) -> ScrapedPost | None:
     )
 
 
-def _extract_complaints(captured_xhr_list: list) -> list[dict[str, Any]]:
+def _extract_complaints(captured_xhr_list: list, debug_slug: str = "") -> list[dict[str, Any]]:
     """Pull complaint dicts out of every captured XHR response.
 
     Each `companyshowcase/company/{id}/items` response carries a
     `data` array. Concat across all captures, return raw dicts.
+
+    When the upstream shape shifts (RA changes field names, payload
+    becomes an array instead of an object, etc.) we log a 200-char
+    preview of each XHR body so the next run's CI log tells us what
+    to adjust without another local probe trip.
     """
     out: list[dict[str, Any]] = []
-    for xhr in captured_xhr_list:
+    for i, xhr in enumerate(captured_xhr_list):
+        url = getattr(xhr, "url", "") or getattr(xhr, "request", {}).get("url", "") if hasattr(xhr, "request") else ""
+        status = getattr(xhr, "status", "?")
         body = getattr(xhr, "body", None)
         if body is None:
             text = getattr(xhr, "text", "")
@@ -124,17 +131,35 @@ def _extract_complaints(captured_xhr_list: list) -> list[dict[str, Any]]:
             body_str = body.decode("utf-8", errors="replace")
         else:
             body_str = str(body)
+        preview = body_str[:200].replace("\n", " ") if body_str else "(empty)"
         if not body_str:
+            print(f"[ra:{debug_slug}] xhr[{i}] empty body url={url} status={status}", flush=True)
             continue
         try:
             data = json.loads(body_str)
         except json.JSONDecodeError:
+            print(f"[ra:{debug_slug}] xhr[{i}] not-json status={status} preview={preview!r}", flush=True)
+            continue
+        if isinstance(data, list):
+            # RA might have flattened the response to a bare array.
+            print(f"[ra:{debug_slug}] xhr[{i}] bare-list len={len(data)} preview={preview!r}", flush=True)
+            out.extend(c for c in data if isinstance(c, dict))
             continue
         if not isinstance(data, dict):
+            print(f"[ra:{debug_slug}] xhr[{i}] non-dict {type(data).__name__} preview={preview!r}", flush=True)
             continue
-        items = data.get("data")
+        items = data.get("data") or data.get("items") or data.get("complaints") or data.get("results")
         if isinstance(items, list):
+            print(
+                f"[ra:{debug_slug}] xhr[{i}] ok keys={list(data.keys())} items={len(items)}",
+                flush=True,
+            )
             out.extend(c for c in items if isinstance(c, dict))
+        else:
+            print(
+                f"[ra:{debug_slug}] xhr[{i}] dict no-list-field keys={list(data.keys())} preview={preview!r}",
+                flush=True,
+            )
     return out
 
 
@@ -190,7 +215,7 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
             break
 
         captured = list(getattr(resp, "captured_xhr", []) or [])
-        complaints = _extract_complaints(captured)
+        complaints = _extract_complaints(captured, debug_slug=slug)
         if not complaints:
             print(
                 f"[ra:{slug}] page {page_no} captured {len(captured)} XHRs "
@@ -230,8 +255,12 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
 
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # `cashu` and `banco-inter` returned 404 on RA — slugs apparently
+    # retired or renamed. Drop until we re-probe with current ones.
+    # The remaining four are confirmed live as of the last manual run.
     brands = args if args else [
-        "nubank", "cashu", "c6-bank", "banco-inter", "picpay", "mercado-pago",
+        "nubank", "c6-bank", "picpay", "mercado-pago",
+        "magazine-luiza", "americanas",  # BR retail giants — high complaint volume
     ]
 
     run_id = os.environ.get("GITHUB_RUN_ID") or datetime.now(timezone.utc).isoformat()
