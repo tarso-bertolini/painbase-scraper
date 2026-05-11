@@ -50,11 +50,14 @@ RA_BASE = "https://www.reclameaqui.com.br"
 # capture round. RA serves ~10 complaints per page on the listing.
 MAX_PAGES_PER_BRAND = 5
 
-# XHR capture regex. Matches the JSON endpoint the SPA actually calls.
-XHR_PATTERN = (
-    r"iosite\.reclameaqui\.com\.br/raichu-io-site-v1/"
-    r"companyshowcase/company/\d+/items"
-)
+# XHR capture regex. Broad on purpose: matches every iosite call so
+# we don't accidentally filter out the actual data XHR if RA tweaks
+# the URL shape. _extract_complaints() does the structural filtering.
+#
+# Previous, tighter pattern was:
+#   iosite\.reclameaqui\.com\.br/raichu-io-site-v1/companyshowcase/company/\d+/items
+# but that missed any sibling endpoint like /complaints, /reviews, etc.
+XHR_PATTERN = r"iosite\.reclameaqui\.com\.br"
 
 
 def _build_complaint_url(c: dict[str, Any], slug: str) -> str | None:
@@ -121,7 +124,15 @@ def _extract_complaints(captured_xhr_list: list, debug_slug: str = "") -> list[d
     """
     out: list[dict[str, Any]] = []
     for i, xhr in enumerate(captured_xhr_list):
-        url = getattr(xhr, "url", "") or getattr(xhr, "request", {}).get("url", "") if hasattr(xhr, "request") else ""
+        # Scrapling's captured XHRs may expose URL via `url` attribute
+        # or via a nested request dict. Try both for safety.
+        url = getattr(xhr, "url", "") or ""
+        if not url and hasattr(xhr, "request"):
+            req = getattr(xhr, "request", None)
+            if isinstance(req, dict):
+                url = req.get("url", "") or ""
+        # Shorten the URL for log readability — keep the path tail.
+        url_short = url.split("iosite.reclameaqui.com.br")[-1] if url else "?"
         status = getattr(xhr, "status", "?")
         body = getattr(xhr, "body", None)
         if body is None:
@@ -133,31 +144,30 @@ def _extract_complaints(captured_xhr_list: list, debug_slug: str = "") -> list[d
             body_str = str(body)
         preview = body_str[:200].replace("\n", " ") if body_str else "(empty)"
         if not body_str:
-            print(f"[ra:{debug_slug}] xhr[{i}] empty body url={url} status={status}", flush=True)
+            print(f"[ra:{debug_slug}] xhr[{i}] {url_short} empty status={status}", flush=True)
             continue
         try:
             data = json.loads(body_str)
         except json.JSONDecodeError:
-            print(f"[ra:{debug_slug}] xhr[{i}] not-json status={status} preview={preview!r}", flush=True)
+            print(f"[ra:{debug_slug}] xhr[{i}] {url_short} not-json status={status} preview={preview!r}", flush=True)
             continue
         if isinstance(data, list):
-            # RA might have flattened the response to a bare array.
-            print(f"[ra:{debug_slug}] xhr[{i}] bare-list len={len(data)} preview={preview!r}", flush=True)
+            print(f"[ra:{debug_slug}] xhr[{i}] {url_short} bare-list len={len(data)}", flush=True)
             out.extend(c for c in data if isinstance(c, dict))
             continue
         if not isinstance(data, dict):
-            print(f"[ra:{debug_slug}] xhr[{i}] non-dict {type(data).__name__} preview={preview!r}", flush=True)
+            print(f"[ra:{debug_slug}] xhr[{i}] {url_short} non-dict {type(data).__name__}", flush=True)
             continue
         items = data.get("data") or data.get("items") or data.get("complaints") or data.get("results")
-        if isinstance(items, list):
+        if isinstance(items, list) and items:
             print(
-                f"[ra:{debug_slug}] xhr[{i}] ok keys={list(data.keys())} items={len(items)}",
+                f"[ra:{debug_slug}] xhr[{i}] {url_short} OK keys={list(data.keys())} items={len(items)}",
                 flush=True,
             )
             out.extend(c for c in items if isinstance(c, dict))
         else:
             print(
-                f"[ra:{debug_slug}] xhr[{i}] dict no-list-field keys={list(data.keys())} preview={preview!r}",
+                f"[ra:{debug_slug}] xhr[{i}] {url_short} empty-list keys={list(data.keys())} preview={preview!r}",
                 flush=True,
             )
     return out
@@ -181,12 +191,16 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
         )
 
         def trigger_lazy_load(page):
-            # Scroll a few viewports to make the SPA load its lazy
-            # complaint cards (which is what triggers the XHR).
-            for _ in range(4):
-                page.mouse.wheel(0, 1500)
-                page.wait_for_timeout(1000)
-            page.wait_for_timeout(1500)
+            # Give the SPA time to hydrate before scrolling — RA's
+            # bundle is heavy and the previous 2s wait wasn't enough.
+            page.wait_for_timeout(3000)
+            # Scroll deeper to make sure we trip the data XHR. The
+            # SPA waits until the complaint list enters viewport
+            # before firing its first iosite call.
+            for _ in range(6):
+                page.mouse.wheel(0, 1800)
+                page.wait_for_timeout(1500)
+            page.wait_for_timeout(2500)
             return page
 
         try:
@@ -195,10 +209,15 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
                 headless=True,
                 network_idle=True,
                 timeout=90000,
-                wait=2000,
+                wait=3000,
                 page_action=trigger_lazy_load,
                 capture_xhr=XHR_PATTERN,
-                disable_resources=True,
+                # disable_resources was blocking JS chunks the SPA
+                # needs to fire its data XHR — left enabled meant
+                # every captured XHR came back empty. Letting CSS/
+                # JS/fonts through costs ~1MB extra per page but is
+                # the difference between empty and useful payload.
+                disable_resources=False,
                 solve_cloudflare=True,
                 humanize=True,
             )
@@ -255,12 +274,13 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
 
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    # `cashu` and `banco-inter` returned 404 on RA — slugs apparently
-    # retired or renamed. Drop until we re-probe with current ones.
-    # The remaining four are confirmed live as of the last manual run.
+    # Slugs verified live in run 25675063154. The previously-listed
+    # `cashu`, `banco-inter`, `magazine-luiza`, `americanas` all 404
+    # — RA slug format is sometimes different from what marketing
+    # implies (e.g., `magazineluiza-001` vs `magazine-luiza`). Stick
+    # to the four we know work; we'll add more after probing.
     brands = args if args else [
         "nubank", "c6-bank", "picpay", "mercado-pago",
-        "magazine-luiza", "americanas",  # BR retail giants — high complaint volume
     ]
 
     run_id = os.environ.get("GITHUB_RUN_ID") or datetime.now(timezone.utc).isoformat()
