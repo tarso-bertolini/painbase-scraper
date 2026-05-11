@@ -50,7 +50,12 @@ RA_BASE = "https://www.reclameaqui.com.br"
 
 # Number of paginated URLs to walk per brand. Each navigation = one
 # capture round. RA serves ~10 complaints per page on the listing.
-MAX_PAGES_PER_BRAND = 5
+#
+# Capped at 2 because: (a) RA's pagination is JS-driven and our
+# XHR capture doesn't honor `?pagina=`, so pages 2+ return the same
+# DOM as page 1 anyway; (b) at ~60s per page hydration, 4 brands × 5
+# pages = 20 min just for nav, blowing past the 30 min GHA cap.
+MAX_PAGES_PER_BRAND = 2
 
 # XHR capture regex. Broad on purpose: matches every iosite call so
 # we don't accidentally filter out the actual data XHR if RA tweaks
@@ -188,14 +193,35 @@ def _parse_html_listing(body: str, slug: str) -> list[ScrapedPost]:
     description + status. The HTML path only yields title + URL,
     but that's enough for our keyword-search pipeline downstream.
     """
-    # 1. Pull every relato href. Each href is the canonical URL for
-    # one complaint and embeds the title in its trailing slug, which
-    # we fall back to when the surrounding markup doesn't expose a
-    # <h3>/<h4>.
-    href_pattern = re.compile(
-        rf'href="(/empresa/{re.escape(slug)}/relato/[^"]+)"'
-    )
-    href_matches = href_pattern.findall(body)
+    # 1. Pull every relato href. Try three patterns in order — RA
+    # has been inconsistent about whether they emit absolute URLs,
+    # protocol-relative URLs, or root-relative paths. Each href
+    # embeds the title in its trailing slug.
+    patterns = [
+        rf'href="(/empresa/{re.escape(slug)}/relato/[^"]+)"',
+        rf'href="(https?://www\.reclameaqui\.com\.br/empresa/{re.escape(slug)}/relato/[^"]+)"',
+        # Last-resort: any href containing /relato/ for this slug,
+        # even if attribute order or quoting varies.
+        rf'href=[\'"][^\'"]*\b/empresa/{re.escape(slug)}/relato/([^\'"]+)[\'"]',
+    ]
+    href_matches: list[str] = []
+    for pat in patterns:
+        href_matches.extend(re.compile(pat).findall(body))
+        if href_matches:
+            break
+
+    # Normalise to root-relative paths. If the third pattern matched,
+    # the capture is just the trailing segment; reconstruct the full
+    # path.
+    normalised: list[str] = []
+    for h in href_matches:
+        if h.startswith("http"):
+            normalised.append(h.replace(RA_BASE, ""))
+        elif h.startswith("/"):
+            normalised.append(h)
+        else:
+            normalised.append(f"/empresa/{slug}/relato/{h}")
+    href_matches = normalised
 
     # Deduplicate (RA frequently emits the same href in card + "open"
     # button markup) while preserving order.
@@ -263,32 +289,33 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
         )
 
         def trigger_lazy_load(page):
-            # Give the SPA time to hydrate before scrolling — RA's
-            # bundle is heavy and the previous 2s wait wasn't enough.
-            page.wait_for_timeout(3000)
-            # Scroll deeper to make sure we trip the data XHR. The
-            # SPA waits until the complaint list enters viewport
-            # before firing its first iosite call.
-            for _ in range(6):
+            # Give the SPA time to hydrate before scrolling.
+            page.wait_for_timeout(2000)
+            # Scroll deeply to make sure complaint cards mount.
+            for _ in range(4):
                 page.mouse.wheel(0, 1800)
-                page.wait_for_timeout(1500)
-            page.wait_for_timeout(2500)
+                page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500)
             return page
 
         try:
             resp = StealthyFetcher.fetch(
                 url,
                 headless=True,
-                network_idle=True,
-                timeout=90000,
-                wait=3000,
+                # network_idle=True waits for ALL XHR activity to
+                # settle, which on RA's analytics-heavy SPA can wait
+                # forever — that's what hung picpay past 30 min in
+                # the previous run. Our scroll callback is enough
+                # to trigger the data XHR; we don't need to wait
+                # for trackers/analytics/etc. to finish.
+                network_idle=False,
+                # Hard ceiling per page: 60s. If Cloudflare or some
+                # other gate is stuck, fail this page and move on
+                # rather than burning the whole 30-min budget.
+                timeout=60000,
+                wait=2500,
                 page_action=trigger_lazy_load,
                 capture_xhr=XHR_PATTERN,
-                # disable_resources was blocking JS chunks the SPA
-                # needs to fire its data XHR — left enabled meant
-                # every captured XHR came back empty. Letting CSS/
-                # JS/fonts through costs ~1MB extra per page but is
-                # the difference between empty and useful payload.
                 disable_resources=False,
                 solve_cloudflare=True,
                 humanize=True,
@@ -319,6 +346,17 @@ def scrape_brand(slug: str) -> list[ScrapedPost]:
                 body_str = body.decode("utf-8", errors="replace")
             else:
                 body_str = str(body or "")
+            # Diagnostic dump: count occurrences of expected card
+            # markers so we can see if RA's HTML still contains them.
+            # Cheap to log and tells us exactly which regex needs
+            # adjusting if the structure shifted.
+            relato_count = body_str.count("/relato/")
+            empresa_count = body_str.count(f"/empresa/{slug}/")
+            print(
+                f"[ra:{slug}] page {page_no} html: body={len(body_str)}b, "
+                f"'/relato/'={relato_count}, '/empresa/{slug}/'={empresa_count}",
+                flush=True,
+            )
             html_posts = _parse_html_listing(body_str, slug)
             if html_posts:
                 added = 0
